@@ -10,7 +10,8 @@ public static class BossNative {
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr window);
     private delegate bool WindowCallback(IntPtr window, IntPtr state);
     [DllImport("user32.dll")] private static extern bool EnumWindows(WindowCallback callback, IntPtr state);
-    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, System.Text.StringBuilder text, int count);
     public static IntPtr[] BrowserWindows() {
         var windows = new System.Collections.Generic.List<IntPtr>();
@@ -45,6 +46,16 @@ public static class BossNative {
 }
 '@
 [BossNative]::ConfigureDpi()
+$terminalWindow = [BossNative]::GetConsoleWindow()
+if ($terminalWindow -eq [IntPtr]::Zero -or ![BossNative]::IsWindowVisible($terminalWindow)) {
+    # Windows Terminal and integrated terminals use a hidden console window.
+    $terminalWindow = [BossNative]::GetForegroundWindow()
+    $terminalRoot = [Windows.Automation.AutomationElement]::FromHandle($terminalWindow)
+    $terminalProcess = (Get-Process -Id $terminalRoot.Current.ProcessId).ProcessName
+    if ($terminalProcess -notin @('WindowsTerminal', 'OpenConsole', 'conhost', 'powershell', 'pwsh', 'cmd', 'Code', 'Cursor')) {
+        $terminalWindow = [IntPtr]::Zero
+    }
+}
 
 $homeDir = $env:BOSS_SCRIPT_HOME
 $jobsUrl = 'https://www.zhipin.com/web/geek/jobs?scale=301,302'
@@ -234,6 +245,18 @@ function Restore-JobWindow {
         }
     }
     throw '选择后 10 秒内未能恢复 Chrome 前台焦点'
+}
+
+function Focus-SelectionTerminal {
+    if ($terminalWindow -ne [IntPtr]::Zero) {
+        if ([BossNative]::IsIconic($terminalWindow)) { [void][BossNative]::ShowWindowAsync($terminalWindow, 9) }
+        for ($attempt = 0; $attempt -lt 5; $attempt++) {
+            [void][BossNative]::SetForegroundWindow($terminalWindow)
+            Start-Sleep -Milliseconds 100
+            if ([BossNative]::GetForegroundWindow() -eq $terminalWindow) { return }
+        }
+    }
+    Write-Host '未能自动切回启动终端，请手动切回后输入编号。'
 }
 
 function Get-DirectionPoint($element) {
@@ -491,6 +514,7 @@ try {
             $number = 1
             Write-Host '只有一个求职方向，自动选择。'
         } else {
+        Focus-SelectionTerminal
         do {
             $answer = Read-Host '请输入编号（输入 q 退出）'
             if ($answer -eq 'q') { exit 0 }
