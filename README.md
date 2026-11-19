@@ -30,6 +30,14 @@ npm start
 
 实际执行时会发起沟通。`npm start` 通过 Windows 无障碍接口读取普通 Chrome，再操作系统鼠标。请保持打开的岗位窗口在前台，运行时避免操作鼠标。`npm run check` 使用相同的界面读取逻辑验证第一条岗位，全程不点击、不滚动。
 
+## 安全与限流开关
+
+- `npm run start:dry`（等价于 `node start-native.mjs --dry-run`）：只走到「立即沟通」按钮前就记录，不实际点击，也不会触发弹窗和打招呼，用于验证识别逻辑。
+- `--max=N` 或环境变量 `BOSS_MAX_JOBS`：单次运行最多处理 N 条岗位，默认 50，避免无人值守时长时间批量操作。
+- `BOSS_CHROME_PATH` 必须指向 `chrome.exe`，其他可执行文件会被拒绝启动。
+- 脚本以 `-ExecutionPolicy Bypass -File` 方式显式执行 `boss-native.ps1`，不再用 `scriptblock::Create` 读取文件动态执行。
+- `.chrome-boss`（登录态）和 `logs`（含截图）已在 `.gitignore` 中排除，请勿打包分享。
+
 ## 页面反复跳转
 
 先按 `Ctrl+C` 停止脚本，关闭脚本专用 Chrome 的所有窗口，再运行 `npm run open`。这个命令使用同一登录配置，按普通方式启动 Chrome。它只打开岗位列表。

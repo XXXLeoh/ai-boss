@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright-core';
@@ -11,6 +11,16 @@ const logs = join(import.meta.dirname, 'logs');
 const waitMs = 10_000;
 const clickGap = 2_000;
 const jobGap = 3_000;
+const dryRun = process.argv.includes('--dry-run');
+const defaultMaxJobs = 50;
+const maxJobs = parseMaxJobs(
+  process.env.BOSS_MAX_JOBS ?? process.argv.find(arg => arg.startsWith('--max='))?.slice('--max='.length),
+);
+
+function parseMaxJobs(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : defaultMaxJobs;
+}
 const selectors = {
   card: '.job-list-container .job-card-wrapper, .job-list-box .job-card-wrapper',
   cardTitle: '.job-name',
@@ -43,6 +53,7 @@ async function launchChrome({ debug = false } = {}) {
     join(process.env.LOCALAPPDATA ?? '', 'Google/Chrome/Application/chrome.exe'),
   ].find(path => path && existsSync(path));
   if (!executable) throw new Error('找不到 Chrome，请将 BOSS_CHROME_PATH 设为 chrome.exe 的完整路径');
+  if (!/chrome\.exe$/i.test(executable)) throw new Error('BOSS_CHROME_PATH 必须指向 chrome.exe');
   await mkdir(profile, { recursive: true });
   const chrome = spawn(executable, [
     `--user-data-dir=${profile}`, '--no-first-run', '--new-window',
@@ -246,6 +257,10 @@ async function run() {
   const processed = new Set();
   let previous;
   for (;;) {
+    if (processed.size >= maxJobs) {
+      console.log(`已达到本次上限 ${maxJobs} 条，停止。`);
+      return;
+    }
     step = previous ? '确认下一条岗位' : '确认第一条岗位';
     job = undefined;
     chatAttempted = false;
@@ -270,6 +285,9 @@ async function run() {
     });
     if (detail.already) {
       console.log(`已跳过「继续沟通」 ${job.title} / ${job.company}`);
+    } else if (dryRun) {
+      console.log(`[dry-run] 将点击「立即沟通」 ${job.title} / ${job.company}（未实际点击）`);
+      count += 1;
     } else {
       step = '点击立即沟通';
       await click(state => {
@@ -335,7 +353,9 @@ try {
     await page.goto(jobsUrl, { waitUntil: 'domcontentloaded', timeout: waitMs });
     loaded = true;
     await run();
-    console.log(`列表处理结束，完成 ${count} 次沟通点击流程。`);
+    console.log(dryRun
+      ? `列表处理结束，dry-run 模式下识别到 ${count} 条待沟通岗位（未实际点击）。`
+      : `列表处理结束，完成 ${count} 次沟通点击流程。`);
   }
 } catch (error) {
   process.exitCode = 1;
@@ -346,4 +366,5 @@ try {
   }
 } finally {
   await browser?.close();
+  await rm(join(profile, 'DevToolsActivePort'), { force: true });
 }

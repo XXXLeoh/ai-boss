@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node start-native.mjs",
+    "start:dry": "node start-native.mjs --dry-run",
     "login": "node boss-chat.mjs --login",
     "open": "node boss-chat.mjs --open",
     "check": "node start-native.mjs --check"

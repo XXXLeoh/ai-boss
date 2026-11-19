@@ -2,3 +2,7 @@ node_modules/
 .chrome-boss/
 logs/
 .npm-cache/
+.env
+.env.*
+*.log
+DevToolsActivePort

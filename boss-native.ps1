@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase, System.Drawing, System.Windows.Forms
 Add-Type @'
 using System;
@@ -71,6 +71,10 @@ $walker = [Windows.Automation.TreeWalker]::RawViewWalker
 $all = [Windows.Automation.Condition]::TrueCondition
 $descendants = [Windows.Automation.TreeScope]::Descendants
 $count = 0
+$dryRun = $env:BOSS_DRY_RUN -eq '1'
+$maxJobs = 50
+$parsedMax = 0
+if ([int]::TryParse($env:BOSS_MAX_JOBS, [ref]$parsedMax) -and $parsedMax -gt 0) { $maxJobs = $parsedMax }
 
 function Get-Value($element) {
     $pattern = $null
@@ -474,9 +478,11 @@ try {
     )
     $chrome = $paths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
     if (!$chrome) { throw '找不到 Chrome，请配置 BOSS_CHROME_PATH' }
+    if ([IO.Path]::GetFileName($chrome) -ne 'chrome.exe') { throw 'BOSS_CHROME_PATH 必须指向 chrome.exe' }
     $profile = Join-Path $homeDir '.chrome-boss'
     $before = [BossNative]::BrowserWindows()
-    Start-Process -FilePath $chrome -ArgumentList ('--user-data-dir="{0}" --no-first-run --new-window "{1}"' -f $profile, $jobsUrl)
+    # Pass each argument separately so a quote or dash inside the path cannot split into extra flags.
+    Start-Process -FilePath $chrome -ArgumentList @("--user-data-dir=$profile", '--no-first-run', '--new-window', $jobsUrl)
     $deadline = $clock.ElapsedMilliseconds + 10000
     do {
         $newWindows = @([BossNative]::BrowserWindows() | Where-Object { $_ -notin $before })
@@ -555,6 +561,10 @@ try {
     $processed = [Collections.Generic.HashSet[string]]::new()
     $recovered = $false
     while ($true) {
+        if ($processed.Count -ge $maxJobs) {
+            Write-Host "已达到本次上限 $maxJobs 条，停止。"
+            break
+        }
         $phase = '确认下一条岗位'
         $job = $null
         $chatAttempted = $false
@@ -648,6 +658,9 @@ try {
         $detail = Wait-State { param($state) Get-Detail $state }
         if ($detail.Already) {
             Write-Host "已跳过「继续沟通」 $($job.Title)"
+        } elseif ($dryRun) {
+            Write-Host "[dry-run] 将点击「立即沟通」 $($job.Title)（未实际点击）"
+            $count++
         } else {
             $phase = '点击立即沟通'
             Invoke-FlowClick -Chatting -Target {
@@ -673,7 +686,11 @@ try {
         $previousId = $job.Id
         [void]$processed.Add($previousId)
     }
-    Write-Host "列表处理结束，完成 $count 次沟通点击流程。"
+    if ($dryRun) {
+        Write-Host "列表处理结束，dry-run 模式下识别到 $count 条待沟通岗位（未实际点击）。"
+    } else {
+        Write-Host "列表处理结束，完成 $count 次沟通点击流程。"
+    }
 } catch {
     Save-Failure $_.Exception.Message
     exit 1
