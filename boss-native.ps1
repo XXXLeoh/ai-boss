@@ -41,7 +41,7 @@ public static class BossNative {
         mouse_event(2, 0, 0, 0, UIntPtr.Zero);
         mouse_event(4, 0, 0, 0, UIntPtr.Zero);
     }
-    public static void Scroll() { mouse_event(0x800, 0, 0, -480, UIntPtr.Zero); }
+    public static void Scroll(int amount) { mouse_event(0x800, 0, 0, amount, UIntPtr.Zero); }
 }
 '@
 [BossNative]::ConfigureDpi()
@@ -297,17 +297,38 @@ function Get-Detail($state) {
 function Get-ClickPoint($item, [switch]$Selecting, [switch]$Direction) {
     if ($Direction) { return Get-DirectionPoint $item }
     if (!$Selecting) { return Get-Point $item -Verify }
-    if (!(Get-Point $item)) { return $null }
+    if (!$item -or !$item.Current.IsEnabled) { return $null }
     $bounds = $item.Current.BoundingRectangle
-    $p = [Windows.Point]::new([int]($bounds.Right - 10), [int]($bounds.Top + $bounds.Height / 2))
+    if ($bounds.IsEmpty -or $bounds.Width -lt 4 -or $bounds.Height -lt 4) { return $null }
+    $jobLinks = @($item.FindAll($descendants, $all) | Where-Object {
+        $_.Current.ControlType -eq [Windows.Automation.ControlType]::Hyperlink -and
+        (Get-JobUrl (Get-Value $_))
+    })
+    $jobIds = @($jobLinks | ForEach-Object { Get-JobUrl (Get-Value $_) } | Select-Object -Unique)
+    foreach ($yFraction in @(0.5, 0.3, 0.15, 0.7)) {
+    foreach ($xFraction in @(0.95, 0.7, 0.5, 0.25)) {
+    $p = [Windows.Point]::new([int]($bounds.Left + $bounds.Width * $xFraction),
+        [int]($bounds.Top + $bounds.Height * $yFraction))
     $hit = [Windows.Automation.AutomationElement]::FromPoint($p)
-    if (!(Test-Within $hit $item)) { return $null }
+    if (!(Test-Within $hit $item)) { continue }
+    $valid = $true
     for ($node = $hit; $node -and ![Windows.Automation.Automation]::Compare($node, $item); $node = $walker.GetParent($node)) {
-        if ($node.Current.ControlType -in @([Windows.Automation.ControlType]::Button, [Windows.Automation.ControlType]::Hyperlink)) {
-            return $null
+        if ($node.Current.ControlType -eq [Windows.Automation.ControlType]::Button) {
+            $valid = $false
+            break
+        }
+        if ($node.Current.ControlType -eq [Windows.Automation.ControlType]::Hyperlink) {
+            $linkId = Get-JobUrl (Get-Value $node)
+            if (!$linkId -or $jobIds.Count -ne 1 -or $jobIds[0] -ne $linkId) {
+                $valid = $false
+                break
+            }
         }
     }
-    return $p
+    if ($valid) { return $p }
+    }
+    }
+    return $null
 }
 
 function Invoke-FlowClick([scriptblock]$target, [switch]$Selecting, [switch]$AllowDialog, [switch]$Chatting,
@@ -538,13 +559,31 @@ try {
                 }
             } elseif ($state.End) { return @{ End = $true } }
             if ($env:BOSS_CHECK_ONLY -ne '1' -and $clock.ElapsedMilliseconds -ge $scroll.Last + 500) {
+                $anchors = @(
                 foreach ($visibleCard in $state.Jobs) {
                     $anchor = Get-ScrollAnchor $visibleCard
-                    if ($anchor -and [BossNative]::GetForegroundWindow() -eq $windowHandle -and
+                    if ($anchor) { $anchor }
+                })
+                if ($anchors.Count -gt 0) {
+                    $ordered = @($anchors | Sort-Object Y)
+                    $anchor = $ordered[[int][Math]::Floor(($ordered.Count - 1) / 2)]
+                    $amount = -360
+                    if ($card) {
+                        $bounds = $card.Element.Current.BoundingRectangle
+                        if (!$bounds.IsEmpty) {
+                            $center = $bounds.Top + $bounds.Height / 2
+                            # A large wheel step can pass the next card. Scroll back toward that card.
+                            $amount = if ($center -lt $anchor.Y) { 120 } else { -120 }
+                            $lastState.scrollTarget = @{
+                                id = $card.Id; top = $bounds.Top; bottom = $bounds.Bottom
+                                anchorY = $anchor.Y; wheel = $amount
+                            }
+                        }
+                    }
+                    if ([BossNative]::GetForegroundWindow() -eq $windowHandle -and
                         [BossNative]::SetCursorPos([int]$anchor.X, [int]$anchor.Y)) {
-                        [BossNative]::Scroll()
+                        [BossNative]::Scroll($amount)
                         $scroll.Last = $clock.ElapsedMilliseconds
-                        break
                     }
                 }
             }
