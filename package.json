@@ -1,0 +1,14 @@
+{
+  "name": "boss-job-chat",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node start-native.mjs",
+    "login": "node boss-chat.mjs --login",
+    "open": "node boss-chat.mjs --open",
+    "check": "node start-native.mjs --check"
+  },
+  "dependencies": {
+    "playwright-core": "1.60.0"
+  }
+}
