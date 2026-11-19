@@ -6,6 +6,8 @@ using System.Runtime.InteropServices;
 public static class BossNative {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr window, int command);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr window);
     private delegate bool WindowCallback(IntPtr window, IntPtr state);
     [DllImport("user32.dll")] private static extern bool EnumWindows(WindowCallback callback, IntPtr state);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
@@ -39,7 +41,7 @@ public static class BossNative {
         mouse_event(2, 0, 0, 0, UIntPtr.Zero);
         mouse_event(4, 0, 0, 0, UIntPtr.Zero);
     }
-    public static void Scroll() { mouse_event(0x800, 0, 0, -120, UIntPtr.Zero); }
+    public static void Scroll() { mouse_event(0x800, 0, 0, -480, UIntPtr.Zero); }
 }
 '@
 [BossNative]::ConfigureDpi()
@@ -47,8 +49,8 @@ public static class BossNative {
 $homeDir = $env:BOSS_SCRIPT_HOME
 $jobsUrl = 'https://www.zhipin.com/web/geek/jobs?scale=301,302'
 $clock = [Diagnostics.Stopwatch]::StartNew()
-$lastClick = -2000
-$lastJob = -3000
+$lastClick = -1000
+$lastJob = -2000
 $phase = '打开普通 Chrome'
 $job = $null
 $chatAttempted = $false
@@ -118,6 +120,32 @@ function Read-Page {
     $script:lastState = @{ address = $address }
 
     $jobs = [Collections.Generic.List[object]]::new()
+    $directions = [Collections.Generic.List[object]]::new()
+    $recommendations = @($items | Where-Object {
+        $_.Current.Name -eq '推荐' -and !$_.Current.IsOffscreen -and
+        $_.Current.ControlType -in @([Windows.Automation.ControlType]::Text,
+            [Windows.Automation.ControlType]::Hyperlink, [Windows.Automation.ControlType]::TabItem)
+    })
+    if ($recommendations.Count -gt 0) {
+        $recommend = $recommendations[0]
+        $row = $recommend.Current.BoundingRectangle
+        $seenNames = [Collections.Generic.HashSet[string]]::new()
+        foreach ($item in $items) {
+            $c = $item.Current
+            $b = $c.BoundingRectangle
+            $label = ([string]$c.Name).Trim()
+            if ($c.IsOffscreen -or $b.IsEmpty -or !$label -or
+                $label -match '^(推荐|[+＋|｜]|搜索|搜索职位、公司|地图)$' -or
+                $b.Left -le $row.Right -or [Math]::Abs(($b.Top + $b.Height / 2) - ($row.Top + $row.Height / 2)) -gt 10 -or
+                $b.Width -gt 320 -or $b.Height -gt 60 -or
+                $c.ControlType -notin @([Windows.Automation.ControlType]::Text,
+                    [Windows.Automation.ControlType]::Hyperlink, [Windows.Automation.ControlType]::TabItem,
+                    [Windows.Automation.ControlType]::ListItem)) { continue }
+            if ($seenNames.Add($label)) {
+                $directions.Add(@{ Name = $label; Element = $item; X = $b.Left })
+            }
+        }
+    }
     $detailLinks = [Collections.Generic.List[object]]::new()
     $texts = [Collections.Generic.List[object]]::new()
     $controls = @{ '立即沟通' = @(); '继续沟通' = @(); '留在此页' = @() }
@@ -162,6 +190,8 @@ function Read-Page {
     }
     return @{
         Handle = $foreground; Jobs = $jobs; DetailLinks = $detailLinks; Texts = $texts
+        Directions = @($directions | Sort-Object X)
+        Recommend = if ($recommendations.Count -gt 0) { $recommendations[0] } else { $null }
         Controls = $controls; Dialogs = $dialogs; End = $atEnd
     }
 }
@@ -176,6 +206,56 @@ function Confirm-Dialog($state, [switch]$Allowed) {
             if ($stay.Count -ne 1 -or !(Test-Within $stay[0] $dialog)) { throw '检测到未知弹窗' }
         }
     }
+}
+
+function Test-DirectionSelected($element) {
+    for ($node = $element; $node; $node = $walker.GetParent($node)) {
+        $bounds = $node.Current.BoundingRectangle
+        if ($bounds.IsEmpty -or $bounds.Height -gt 60) { return $false }
+        $pattern = $null
+        if ($node.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern) -and
+            $pattern.Current.IsSelected) { return $true }
+        if ($node.Current.ClassName -match '(^|[\s_-])(active|selected|current)($|[\s_-])') { return $true }
+    }
+    return $false
+}
+
+function Restore-JobWindow {
+    $deadline = $clock.ElapsedMilliseconds + 10000
+    if ([BossNative]::IsIconic($windowHandle)) { [void][BossNative]::ShowWindowAsync($windowHandle, 9) }
+    while ($clock.ElapsedMilliseconds -lt $deadline) {
+        if ([BossNative]::GetForegroundWindow() -ne $windowHandle) {
+            [void][BossNative]::SetForegroundWindow($windowHandle)
+        }
+        Start-Sleep -Milliseconds 150
+        if ([BossNative]::GetForegroundWindow() -eq $windowHandle) {
+            Start-Sleep -Milliseconds 150
+            if ([BossNative]::GetForegroundWindow() -eq $windowHandle) { return }
+        }
+    }
+    throw '选择后 10 秒内未能恢复 Chrome 前台焦点'
+}
+
+function Get-DirectionPoint($element) {
+    if (!$element -or !$element.Current.IsEnabled -or $element.Current.IsOffscreen) { return $null }
+    $bounds = $element.Current.BoundingRectangle
+    if ($bounds.IsEmpty) { return $null }
+    # Text bounds can extend beyond an ellipsis. Restrict input to the visible container.
+    $clip = $bounds
+    $container = $element
+    for ($parent = $walker.GetParent($element); $parent; $parent = $walker.GetParent($parent)) {
+        $b = $parent.Current.BoundingRectangle
+        if ($b.IsEmpty -or $b.Height -gt 65 -or $b.Width -gt 350) { break }
+        $clip.Intersect($b)
+        $container = $parent
+    }
+    if ($clip.IsEmpty -or $clip.Width -lt 4 -or $clip.Height -lt 4) { return $null }
+    foreach ($fraction in @(0.2, 0.35, 0.5, 0.65)) {
+        $p = [Windows.Point]::new([int]($clip.Left + $clip.Width * $fraction),
+            [int]($clip.Top + $clip.Height / 2))
+        if (Test-Within ([Windows.Automation.AutomationElement]::FromPoint($p)) $container) { return $p }
+    }
+    return $null
 }
 
 function Wait-State([scriptblock]$check, [switch]$AllowDialog) {
@@ -214,7 +294,8 @@ function Get-Detail($state) {
     return @{ Element = $control; Already = ($already.Count -eq 1) }
 }
 
-function Get-ClickPoint($item, [switch]$Selecting) {
+function Get-ClickPoint($item, [switch]$Selecting, [switch]$Direction) {
+    if ($Direction) { return Get-DirectionPoint $item }
     if (!$Selecting) { return Get-Point $item -Verify }
     if (!(Get-Point $item)) { return $null }
     $bounds = $item.Current.BoundingRectangle
@@ -229,9 +310,10 @@ function Get-ClickPoint($item, [switch]$Selecting) {
     return $p
 }
 
-function Invoke-FlowClick([scriptblock]$target, [switch]$Selecting, [switch]$AllowDialog, [switch]$Chatting) {
-    $earliest = $lastClick + 2000
-    if ($Selecting) { $earliest = [Math]::Max($earliest, $lastJob + 3000) }
+function Invoke-FlowClick([scriptblock]$target, [switch]$Selecting, [switch]$AllowDialog, [switch]$Chatting,
+    [switch]$Direction) {
+    $earliest = $lastClick + 1000
+    if ($Selecting) { $earliest = [Math]::Max($earliest, $lastJob + 2000) }
     while ($clock.ElapsedMilliseconds -lt $earliest) {
         $state = Read-Page
         Confirm-Dialog $state -Allowed:$AllowDialog
@@ -239,11 +321,11 @@ function Invoke-FlowClick([scriptblock]$target, [switch]$Selecting, [switch]$All
     }
     $state = Read-Page
     Confirm-Dialog $state -Allowed:$AllowDialog
-    $point = Get-ClickPoint (& $target $state) -Selecting:$Selecting
+    $point = Get-ClickPoint (& $target $state) -Selecting:$Selecting -Direction:$Direction
     if (!$point -or ![BossNative]::SetCursorPos([int]$point.X, [int]$point.Y)) { throw '目标不可点击' }
     $state = Read-Page
     Confirm-Dialog $state -Allowed:$AllowDialog
-    $confirm = Get-ClickPoint (& $target $state) -Selecting:$Selecting
+    $confirm = Get-ClickPoint (& $target $state) -Selecting:$Selecting -Direction:$Direction
     if (!$confirm -or $confirm.X -ne $point.X -or $confirm.Y -ne $point.Y -or
         [BossNative]::GetForegroundWindow() -ne $windowHandle -or
         ![BossNative]::At([int]$point.X, [int]$point.Y)) { throw '点击前目标或鼠标位置发生变化' }
@@ -254,16 +336,56 @@ function Invoke-FlowClick([scriptblock]$target, [switch]$Selecting, [switch]$All
 
 function Find-Next($state, $previousId) {
     if (!$previousId) {
-        if ($state.Jobs.Count -gt 0) { return $state.Jobs[0] }
+        foreach ($card in $state.Jobs) {
+            if (!$processed.Contains($card.Id)) { return $card }
+        }
         return $null
     }
     for ($index = 0; $index -lt $state.Jobs.Count; $index++) {
         if ($state.Jobs[$index].Id -eq $previousId) {
-            if ($index + 1 -lt $state.Jobs.Count) { return $state.Jobs[$index + 1] }
+            for ($nextIndex = $index + 1; $nextIndex -lt $state.Jobs.Count; $nextIndex++) {
+                if (!$processed.Contains($state.Jobs[$nextIndex].Id)) { return $state.Jobs[$nextIndex] }
+            }
             return $null
         }
     }
     throw '列表已改变，无法确认下一条岗位'
+}
+
+function Switch-Direction([string]$name, [switch]$Recommend) {
+    $script:phase = if ($Recommend) { '切换到推荐以刷新列表' } else { "切换求职方向：$name" }
+    $before = Read-Page
+    Confirm-Dialog $before
+    $idsBefore = ($before.Jobs | ForEach-Object Id) -join '|'
+    $target = {
+        param($s)
+        if ($Recommend) { return $s.Recommend }
+        $matches = @($s.Directions | Where-Object { $_.Name -ceq $name })
+        if ($matches.Count -eq 1) { return $matches[0].Element }
+    }
+    $null = Wait-State { param($s) Get-DirectionPoint (& $target $s) }
+    Invoke-FlowClick -Direction -Target $target
+    $null = Wait-State {
+        param($s)
+        $element = & $target $s
+        $idsNow = ($s.Jobs | ForEach-Object Id) -join '|'
+        if ($element -and ($s.Jobs.Count -gt 0 -or $s.End) -and
+            ((Test-DirectionSelected $element) -or $idsNow -ne $idsBefore)) { return $true }
+    }
+}
+
+function Get-ScrollAnchor($card) {
+    $bounds = $card.Element.Current.BoundingRectangle
+    if ($bounds.IsEmpty) { return $null }
+    $windowBounds = [Windows.Automation.AutomationElement]::FromHandle($windowHandle).Current.BoundingRectangle
+    $bounds.Intersect($windowBounds)
+    if ($bounds.IsEmpty -or $bounds.Height -lt 8) { return $null }
+    foreach ($fraction in @(0.5, 0.2, 0.8)) {
+        $point = [Windows.Point]::new([int]($bounds.Right - 10),
+            [int]($bounds.Top + $bounds.Height * $fraction))
+        if (Test-Within ([Windows.Automation.AutomationElement]::FromPoint($point)) $card.Element) { return $point }
+    }
+    return $null
 }
 
 function Save-Failure($reason) {
@@ -336,13 +458,63 @@ try {
         throw '10 秒内未确认普通 Chrome 岗位页，请检查新打开的窗口是否已登录并处于前台'
     }
     $windowHandle = $initial.Handle
+    $phase = '读取求职方向'
+    $options = @(Wait-State { param($s) if ($s.Directions.Count -gt 0) { $s.Directions } })
+    Write-Host '从当前页面读取到以下求职方向：'
+    for ($i = 0; $i -lt $options.Count; $i++) {
+        Write-Host ("{0}. {1}" -f ($i + 1), $options[$i].Name)
+    }
+    if ($env:BOSS_CHECK_ONLY -ne '1') {
+        $phase = '等待用户选择求职方向'
+        if ($options.Count -eq 1) {
+            $number = 1
+            Write-Host '只有一个求职方向，自动选择。'
+        } else {
+        do {
+            $answer = Read-Host '请输入编号（输入 q 退出）'
+            if ($answer -eq 'q') { exit 0 }
+            $number = 0
+            $valid = [int]::TryParse($answer, [ref]$number) -and $number -ge 1 -and $number -le $options.Count
+            if (!$valid) { Write-Host '请输入列表内的有效编号。' }
+        } until ($valid)
+        }
+        $selectedName = $options[$number - 1].Name
+        # Reading terminal input changes focus. Restore only the already verified Chrome window.
+        Restore-JobWindow
+        $phase = '点击所选求职方向'
+        $beforeState = Read-Page
+        Confirm-Dialog $beforeState
+        $beforeIds = ($beforeState.Jobs | ForEach-Object Id) -join '|'
+        $null = Wait-State {
+            param($s)
+            $matches = @($s.Directions | Where-Object { $_.Name -ceq $selectedName })
+            if ($matches.Count -eq 1) { Get-DirectionPoint $matches[0].Element }
+        }
+        Invoke-FlowClick -Direction -Target {
+            param($s)
+            $matches = @($s.Directions | Where-Object { $_.Name -ceq $selectedName })
+            if ($matches.Count -eq 1) { $matches[0].Element }
+        }
+        $phase = '等待所选方向岗位列表'
+        $null = Wait-State {
+            param($s)
+            $matches = @($s.Directions | Where-Object { $_.Name -ceq $selectedName })
+            if ($matches.Count -ne 1 -or $s.Jobs.Count -eq 0) { return $null }
+            $selected = Test-DirectionSelected $matches[0].Element
+            $ids = ($s.Jobs | ForEach-Object Id) -join '|'
+            if ($selected -or $ids -ne $beforeIds) { return $true }
+        }
+        Write-Host "已选择：$selectedName"
+    }
     $previousId = ''
     $processed = [Collections.Generic.HashSet[string]]::new()
+    $recovered = $false
     while ($true) {
         $phase = '确认下一条岗位'
         $job = $null
         $chatAttempted = $false
         $scroll = @{ Last = -1000 }
+        try {
         $next = Wait-State {
             param($state)
             $card = Find-Next $state $previousId
@@ -367,7 +539,7 @@ try {
             } elseif ($state.End) { return @{ End = $true } }
             if ($env:BOSS_CHECK_ONLY -ne '1' -and $clock.ElapsedMilliseconds -ge $scroll.Last + 500) {
                 foreach ($visibleCard in $state.Jobs) {
-                    $anchor = Get-ClickPoint $visibleCard.Element -Selecting
+                    $anchor = Get-ScrollAnchor $visibleCard
                     if ($anchor -and [BossNative]::GetForegroundWindow() -eq $windowHandle -and
                         [BossNative]::SetCursorPos([int]$anchor.X, [int]$anchor.Y)) {
                         [BossNative]::Scroll()
@@ -376,6 +548,25 @@ try {
                     }
                 }
             }
+        }
+        } catch {
+            if ($env:BOSS_CHECK_ONLY -eq '1' -or
+                $_.Exception.Message -notmatch '确认下一条岗位：10 秒内未满足页面条件|列表已改变，无法确认下一条岗位' -or $recovered) { throw }
+            Save-Failure $_.Exception.Message
+            Write-Host '滚动后仍无法确认下一条，切换方向后重新选择岗位。'
+            $state = Read-Page
+            Confirm-Dialog $state
+            $alternatives = @($state.Directions | Where-Object { $_.Name -cne $selectedName })
+            if ($alternatives.Count -gt 0) {
+                $selectedName = $alternatives[0].Name
+                Switch-Direction $selectedName
+            } else {
+                Switch-Direction -Recommend
+                Switch-Direction $selectedName
+            }
+            $previousId = ''
+            $recovered = $true
+            continue
         }
         if ($next.End) { break }
         $job = $next
@@ -415,6 +606,7 @@ try {
             Write-Host "已完成沟通点击流程 $($job.Title)"
         }
         $lastJob = $clock.ElapsedMilliseconds
+        $recovered = $false
         $previousId = $job.Id
         [void]$processed.Add($previousId)
     }
