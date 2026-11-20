@@ -367,19 +367,36 @@ function Invoke-FlowClick([scriptblock]$target, [switch]$Selecting, [switch]$All
         Confirm-Dialog $state -Allowed:$AllowDialog
         Start-Sleep -Milliseconds 80
     }
+    $deadline = $clock.ElapsedMilliseconds + 10000
+    do {
     $state = Read-Page
     Confirm-Dialog $state -Allowed:$AllowDialog
     $point = Get-ClickPoint (& $target $state) -Selecting:$Selecting -Direction:$Direction
-    if (!$point -or ![BossNative]::SetCursorPos([int]$point.X, [int]$point.Y)) { throw '目标不可点击' }
+    if (!$point) {
+        Start-Sleep -Milliseconds 100
+        continue
+    }
+    if (![BossNative]::SetCursorPos([int]$point.X, [int]$point.Y)) { throw '无法移动鼠标到目标位置' }
     $state = Read-Page
     Confirm-Dialog $state -Allowed:$AllowDialog
     $confirm = Get-ClickPoint (& $target $state) -Selecting:$Selecting -Direction:$Direction
-    if (!$confirm -or $confirm.X -ne $point.X -or $confirm.Y -ne $point.Y -or
-        [BossNative]::GetForegroundWindow() -ne $windowHandle -or
-        ![BossNative]::At([int]$point.X, [int]$point.Y)) { throw '点击前目标或鼠标位置发生变化' }
+    $lastState.clickCheck = @{
+        original = @{ x = $point.X; y = $point.Y }
+        confirmed = if ($confirm) { @{ x = $confirm.X; y = $confirm.Y } } else { $null }
+    }
+    if ([BossNative]::GetForegroundWindow() -ne $windowHandle) { throw '点击前 Chrome 失去前台焦点' }
+    if (![BossNative]::At([int]$point.X, [int]$point.Y)) { throw '点击前鼠标被移动' }
+    if (!$confirm -or $confirm.X -ne $point.X -or $confirm.Y -ne $point.Y) {
+        Start-Sleep -Milliseconds 100
+        continue
+    }
+    if ($clock.ElapsedMilliseconds -ge $deadline) { break }
     if ($Chatting) { $script:chatAttempted = $true }
     [BossNative]::Click()
     $script:lastClick = $clock.ElapsedMilliseconds
+    return
+    } while ($clock.ElapsedMilliseconds -lt $deadline)
+    throw '10 秒内点击目标未稳定，未执行点击'
 }
 
 function Find-Next($state, $previousId) {
